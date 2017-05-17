@@ -28,10 +28,13 @@
 		<script id="vertexShader" type="x-shader/x-vertex">
 			varying vec3 vNormal;
 			varying vec3 vPosition;
+			varying vec2 uVv;
+
 			void main() {
 				vec4 vPos = modelViewMatrix * vec4( position, 1.0 );
 				vPosition = vPos.xyz;
 				vNormal = normalMatrix * normal;
+				uVv = uv;
 				gl_Position = projectionMatrix * vPos;
 			}
 		</script>
@@ -39,14 +42,18 @@
 		<script id="fragmentShader" type="x-shader/x-fragment">
 			varying vec3 vNormal;
 			varying vec3 vPosition;
+			varying vec2 uVv;
 			uniform vec3 pointLightPosition; // in world space
 			uniform vec3 clight;
 			uniform float roughness;
 			uniform int metalness;
 			uniform vec3 materialColor;
+			uniform samplerCube envMap;
 			const float PI = 3.14159;
 
-			vec3 FSchlick(float lDoth,vec3 spec) {
+			#define saturate(a) clamp( a, 0.0, 1.0 )
+
+			vec3 FSchlick(float lDoth, vec3 spec) {
 				return (spec + (vec3(1.0) - spec) * pow(1.0 - lDoth, 5.0));
 			}
 
@@ -61,8 +68,34 @@
 			}
 
 			float GSmith(float nDotv, float nDotl) {
-					float k = roughness*roughness;
-					return G1(nDotl,k)*G1(nDotv,k);
+				float k = roughness*roughness;
+				return G1(nDotl,k)*G1(nDotv,k);
+			}
+
+			vec3 inverseTransformDirection( in vec3 dir, in mat4 matrix ) {
+				return normalize( ( vec4( dir, 0.0 ) * matrix ).xyz );
+			}
+
+			float getSpecularMIPLevel( const in float blinnShininessExponent, const in int maxMIPLevel ) {
+		 		float maxMIPLevelScalar = float( maxMIPLevel );
+		 		float desiredMIPLevel = maxMIPLevelScalar - 0.79248 - 0.5 * log2( pow( blinnShininessExponent, 2.0 ) + 1.0 );
+		 		return clamp( desiredMIPLevel, 0.0, maxMIPLevelScalar );
+		 	}
+
+			float GGXRoughnessToBlinnExponent( const in float ggxRoughness ) {
+		  		return ( 2.0 / pow( ggxRoughness + 0.0001 , 2.0 ) - 2.0 );
+		  	}
+
+		  	vec3 BRDF_Specular_GGX_Environment( vec3 normal, vec3 viewDir, const in vec3 cspec, const in float roughness ) {
+
+				float dotNV = saturate( dot( normal, viewDir ) );
+				const vec4 c0 = vec4( - 1, - 0.0275, - 0.572, 0.022 );
+				const vec4 c1 = vec4( 1, 0.0425, 1.04, - 0.04 );
+				vec4 r = roughness * c0 + c1;
+				float a004 = min( r.x * r.x, exp2( - 9.28 * dotNV ) ) * r.x + r.y;
+				vec2 AB = vec2( -1.04, 1.04 ) * a004 + r.zw;
+				return cspec * AB.x + AB.y;
+
 			}
 
 			void main() {
@@ -70,16 +103,20 @@
 				vec3 cdiff;
 				if(metalness == 1){
 					cspec = materialColor;
-					cdiff = vec3( 0.0 );
+					cdiff = vec3( 0.01 );
 				}else{
 					cdiff = materialColor;
 					cspec = vec3( 0.04 );
 				}
+
 				vec4 lPosition = viewMatrix * vec4( pointLightPosition, 1.0 );
 				vec3 l = normalize(lPosition.xyz - vPosition.xyz);
-				vec3 n = normalize( vNormal );  // interpolation destroys normalization, so we have to normalize
+				vec3 n = normalize( vNormal ); 											// interpolation destroys normalization, so we have to normalize
 				vec3 v = normalize( -vPosition);
+				vec3 vReflect = reflect(vPosition, n);
 				vec3 h = normalize( v + l);
+				vec3 r = inverseTransformDirection( vReflect, viewMatrix );
+
 				// small quantity to prevent divisions by 0
 				float nDotl = max(dot( n, l ),0.000001);
 				float lDoth = max(dot( l, h ),0.000001);
@@ -87,15 +124,23 @@
 				float vDoth = max(dot( v, h ),0.000001);
 				float nDotv = max(dot( n, v ),0.000001);
 
-				vec3 fresnel = FSchlick(lDoth, cspec);
+				float blinnShininessExponent = GGXRoughnessToBlinnExponent(roughness);
+				float specularMIPLevel = getSpecularMIPLevel(blinnShininessExponent ,8 );
 
-				vec3 BRDF = (vec3(1.0) - fresnel) * cdiff/PI + fresnel * GSmith(nDotv, nDotl) * DGGX(nDoth, roughness*roughness) / (4.0 * nDotl * nDotv);
+				vec3 envLight = textureCubeLodEXT( envMap, vec3(-r.x, r.yz), specularMIPLevel ).rgb;
+				envLight = pow( envLight, vec3(2.2));
 
-				vec3 outRadiance = PI* clight * nDotl * BRDF;
+				vec3 fresnel = FSchlick(nDotv, cspec);
 
-				gl_FragColor = vec4(pow( outRadiance, vec3(1.0/2.2)), 1.0);
+				vec3 BRDF = (vec3(1.0) - fresnel) * cdiff/PI + ( fresnel * GSmith(nDotv, nDotl) * DGGX(nDoth, roughness*roughness) )/ (4.0 * nDotl * nDotv);
+
+				vec3 outRadiance =   envLight*BRDF_Specular_GGX_Environment(n, v, cspec, roughness) + PI * clight * nDotl * BRDF;
+
+				gl_FragColor = vec4(pow( abs(outRadiance), vec3(1.0/2.2)), 1.0);
 			}
+
 		</script>
+
 
 		<script>
 		
@@ -105,24 +150,42 @@
 			red: 1.0,
 			green: 1.0,
 			blue: 1.0,
-			intensity: 5
-		}
-		var materialParameter = {
-			//metalness: 1,
-			roughness: 0.3
+			intensity: 2.0
 		}
 
-		var uniforms = {
-			materialColor : {type: "vec3", value: new THREE.Vector3()},
-			metalness: {type: "int", value: 1},
-			roughness: {type: "float", value: 0.01},
-			pointLightPosition:	{ type: "v3", value: new THREE.Vector3() },
-			clight:	{ type: "v3", value: new THREE.Vector3() },
-		};
+		var loader = new THREE.CubeTextureLoader();
+		loader.setPath( 'cubemap/strada/' );
+
+		var textureCube = loader.load( [
+			'posx.png', 'negx.png',
+			'posy.png', 'negy.png',
+			'posz.png', 'negz.png'
+		] );
+
+		textureCube.minFilter = THREE.LinearMipMapLinearFilter;
+
+		materialExtensions = {
+				derivatives: true, // set to use derivatives
+				shaderTextureLOD: true // set to use shader texture LOD
+			};
+
+		var uniforms= new Array(10);
+		for(var  i=0; i<10; i++){
+			uniforms[i] = {
+				materialColor : {type: "vec3", value: new THREE.Vector3()},
+				metalness: {type: "int", value: 1},
+				roughness: {type: "float", value: 0.1},
+				pointLightPosition:	{ type: "v3", value: new THREE.Vector3() },
+				clight:	{ type: "v3", value: new THREE.Vector3() },
+				envMap:	{ type: "t", value: textureCube}
+			};
+		}
 
 		var light = new THREE.Mesh( new THREE.SphereGeometry( 1, 16, 16), new THREE.MeshBasicMaterial ({color: 0xffff00, wireframe:true}) );
 		light.position.set( 0.0, 7.0, 17.0 );
-		uniforms.pointLightPosition.value = new THREE.Vector3(light.position.x, light.position.y, light.position.z);
+		for(var  i=0; i<10; i++){
+			uniforms[i].pointLightPosition.value = new THREE.Vector3(light.position.x, light.position.y, light.position.z);
+		}
 		
 		function Start() {
 			scene = new THREE.Scene();
@@ -133,10 +196,11 @@
 			renderer.setClearColor( 0xf0f0f0 );
 			document.body.appendChild( renderer.domElement );
 			
-			camera.position.set(0,2,10);
+			camera.position.set(0,2,5);
 			camera.lookAt( new THREE.Vector3(0,0,0));
 			scene.add( camera );
 
+			scene.background = textureCube;
 
 			stats = new Stats();
 			stats.domElement.style.position = 'absolute';
@@ -151,66 +215,139 @@
 			controls.minDistance = 5;
 			controls.maxDistance = 100;
 			//controls.maxPolarAngle = Math.PI / 2;
-			controls.enablePan = false;
+			controls.enablePan = true;				//movement with rigth click
 			controls.target.copy( scene.position );
 			controls.update();
 
 			scene.add( light );
 
-			var material = new THREE.ShaderMaterial( {
-					uniforms: uniforms,
+			var materialSteel = new THREE.ShaderMaterial( {
+					uniforms: uniforms[0],
 					vertexShader: document.getElementById( 'vertexShader' ).textContent,
-					fragmentShader: document.getElementById( 'fragmentShader' ).textContent
+					fragmentShader: document.getElementById( 'fragmentShader' ).textContent,
+					extensions: materialExtensions
+				});
+				materialIron = new THREE.ShaderMaterial( {
+					uniforms: uniforms[1],
+					vertexShader,
+					fragmentShader,
+					extensions: materialExtensions
+				}),
+				materialAlluminium = new THREE.ShaderMaterial( {
+					uniforms: uniforms[2],
+					vertexShader: document.getElementById( 'vertexShader' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShader' ).textContent,
+					extensions: materialExtensions
+				}),
+				materialRubber = new THREE.ShaderMaterial( {
+					uniforms: uniforms[3],
+					vertexShader: document.getElementById( 'vertexShader' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShader' ).textContent,
+					extensions: materialExtensions
 				});
 
-			//material2.metalness = 1.0;
+			materialSteel.uniforms.materialColor.value = new THREE.Vector3(0.560, 0.570, 0.580);						//iron
+			materialSteel.uniforms.roughness.value = 0.2;
+		    materialSteel.uniforms.metalness.value = 1;
+
+
+		    //materialIron = materialAlluminium.clone();
+		    materialIron.vertexShader = document.getElementById( 'vertexShader' ).textContent;
+		    materialIron.fragmentShader = document.getElementById( 'fragmentShader' ).textContent;
+		    materialIron.uniforms.materialColor.value = new THREE.Vector3(0.260, 0.270, 0.280);						//iron
+			materialIron.uniforms.roughness.value = 0.5;
+		    materialIron.uniforms.metalness.value = 1;
+
+
+		    materialAlluminium.uniforms.materialColor.value = new THREE.Vector3(1, 0, 0);							//alluminium
+			materialAlluminium.uniforms.roughness.value = 0.4;
+		    materialAlluminium.uniforms.metalness.value = 1;
+
+		    materialRubber.uniforms.materialColor.value = new THREE.Vector3(0, 0, 0);								//black
+			materialRubber.uniforms.roughness.value = 0.8;
+		    materialRubber.uniforms.metalness.value = 0;
+				
 			
-			var loader = new THREE.OBJLoader(); 
-			loader.load(
+			var loader = new THREE.OBJLoader();
+			loader.load( 'Modelli/BrakeDisc/F1-2000_Brake_01.obj',
+				function ( group ) {
+					var length = group.children.length;
+					for(var i = 0; i < length; i++){
+						var child = group.children[ i ];
+						if ( child.name.includes('polymsh92')) {
+							geometry = child.geometry;
+							mesh = new THREE.Mesh( geometry, materialSteel );
+							mesh.matrix.makeTranslation( 29, -16, -18 );
+	 						mesh.matrixAutoUpdate = false;
+							scene.add( mesh );
+						}else if (child.name.includes('polymsh93') || child.name.includes('polymsh_extracted33') || child.name.includes('polymsh20') || child.name.includes('polymsh22') || child.name.includes('polymsh17') || child.name.includes('polymsh27') || child.name.includes('polymsh101')) {
+							geometry = child.geometry;
+							mesh = new THREE.Mesh( geometry, materialIron );
+							mesh.matrix.makeTranslation( 29, -16, -18 );
+	 						mesh.matrixAutoUpdate = false;
+							scene.add( mesh );
+						}else if(child.name.includes('polymsh26')){
+		            		geometry = child.geometry;
+							mesh = new THREE.Mesh( geometry, materialAlluminium );
+							mesh.matrix.makeTranslation( 29, -16, -18 );
+	 						mesh.matrixAutoUpdate = false;
+							scene.add( mesh );
+						}else if(child.name.includes('polymsh95') || child.name.includes('polymsh96')){
+							geometry = child.geometry;
 
- 				'Modelli/BrakeDisc/F1-2000_Brake_01.obj',
+							mesh = new THREE.Mesh( geometry, materialRubber );
 
- 				function ( object ) {
+							mesh.matrix.makeTranslation( 29, -16, -18 );
+	 						mesh.matrixAutoUpdate = false;
+							scene.add( mesh );
+						}
+					}
 
- 					object.matrix.makeTranslation( 29, -16, -18 );
- 					object.matrixAutoUpdate = false;
+				}
+			);
+			
 
- 					object.traverse(function (child) {
+		}
 
-		            	if (child.name && (child.name.includes('polymsh92') || child.name.includes('polymsh93'))) {
-		            		var m = material.clone();
-		            		m.uniforms.materialColor.value = new THREE.Vector3(0.9, 0.9, 0.9);
-		            		m.uniforms.roughness.value = 0.1;
-		            		m.uniforms.metalness.value = 1;
-		            		child.material = m;
-		            	}else if(child.name && child.name.includes('polymsh26')){
-		            		var m = material.clone();
-		            		m.uniforms.materialColor.value = new THREE.Vector3(1, 1, 0);
-		            		m.uniforms.roughness.value = 0.1;
-		            		m.uniforms.metalness.value = 1;
-		            		child.material = m;
-		            	}else if(child.name && (child.name.includes('polymsh95') || child.name.includes('polymsh96'))){
-		            		var m = material.clone();
-		            		m.uniforms.materialColor.value = new THREE.Vector3(0, 0, 0);
-		            		m.uniforms.roughness.value = 0.5;
-		            		m.uniforms.metalness.value = 0;
-		            		child.material = m;
-		            	}else if(child.name && child.name.includes('polymsh20')){
-		            		var m = material.clone();
-		            		m.uniforms.materialColor.value = new THREE.Vector3(0.6, 0.6, 0.6);
-		            		m.uniforms.roughness.value = 0.3;
-		            		m.uniforms.metalness.value = 1;
-		            		child.material = m;
-		            	}
+		function clone(obj) {
+		    // Handle the 3 simple types, and null or undefined
+		    if (null == obj || "object" != typeof obj) return obj;
 
+		    // Handle Date
+		    if (obj instanceof Date) {
+		        var copy = new Date();
+		        copy.setTime(obj.getTime());
+		        return copy;
+		    }
 
+		    // Handle Array
+		    if (obj instanceof Array) {
+		        var copy = [];
+		        for (var i = 0, len = obj.length; i < len; i++) {
+		            copy[i] = clone(obj[i]);
+		        }
+		        return copy;
+		    }
 
+		    // Handle Object
+		    if (obj instanceof Object) {
+		        var copy = {};
+		        for (var attr in obj) {
+		            if (obj.hasOwnProperty(attr)) copy[attr] = clone(obj[attr]);
+		        }
+		        return copy;
+		    }
 
-		            	
-		            });
+    		throw new Error("Unable to copy obj! Its type isn't supported.");
+		}
 
-     				scene.add( object );
- 				});
+		function find(v, s){
+			for(var i = 0; i < v.length; i++){
+				if(v[i].name == s){
+					return i;
+				}
+			}
+			return 0;
 		}
 		
 		function Update() {
@@ -240,16 +377,7 @@
 				lightSettings.add(lightParameters,'red').min(0).max(1).onChange( function(newVal) { Render() });
 				lightSettings.add(lightParameters,'green').min(0).max(1).onChange( function(newVal) { Render() });
 				lightSettings.add(lightParameters,'blue').min(0).max(1).onChange( function(newVal) { Render() });
-				lightSettings.add(lightParameters,'intensity').min(0).max(10).onChange( function(newVal) { Render() });
-
-				cdiffSettings = gui.addFolder('Material Parameters');
-				/*cdiffSettings.add(materialParameter,'cdiff_red').min(0).max(1).onChange( function(newVal) { Render() });
-				cdiffSettings.add(materialParameter,'cspec_red').min(0).max(1).onChange( function(newVal) { Render() });
-				cdiffSettings.add(materialParameter,'cdiff_green').min(0).max(1).onChange( function(newVal) { Render() });
-				cdiffSettings.add(materialParameter,'cspec_green').min(0).max(1).onChange( function(newVal) { Render() });
-				cdiffSettings.add(materialParameter,'cdiff_blue').min(0).max(1).onChange( function(newVal) { Render() });
-				cdiffSettings.add(materialParameter,'cspec_blue').min(0).max(1).onChange( function(newVal) { Render() });*/
-				cdiffSettings.add(materialParameter,'roughness').min(0).max(1).onChange( function(newVal) { Render() });
+				lightSettings.add(lightParameters,'intensity').min(0).max(10).onChange( function(newVal) { Render()});
 
 			}
 
@@ -257,13 +385,14 @@
 
 				//uniforms.cspec.value = new THREE.Vector3(materialParameter.cspec_red, materialParameter.cspec_green, materialParameter.cspec_blue);
 				//uniforms.cdiff.value = new THREE.Vector3(materialParameter.cdiff_red, materialParameter.cdiff_green, materialParameter.cdiff_blue);
-				uniforms.roughness.value = materialParameter.roughness>0.0 ? materialParameter.roughness:0.01;
-
-				uniforms.clight.value = new THREE.Vector3(
-					lightParameters.red * lightParameters.intensity,
-				    lightParameters.green * lightParameters.intensity,
-					lightParameters.blue * lightParameters.intensity
-				);
+				//uniforms.roughness.value = materialParameter.roughness>0.0 ? materialParameter.roughness:0.01;
+				for(var  i=0; i<10; i++){
+					uniforms[i].clight.value = new THREE.Vector3(
+						lightParameters.red * lightParameters.intensity,
+					    lightParameters.green * lightParameters.intensity,
+						lightParameters.blue * lightParameters.intensity
+					);
+				}
 			}
 
 			Start();
